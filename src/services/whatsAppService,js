@@ -1,0 +1,257 @@
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestWaWebVersion
+} = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode-terminal');
+const config = require('../config');
+const telegramService = require('./telegramService');
+const googleSheetsService = require('./googleSheetsService');
+const zoomService = require('./zoomService');
+
+class WhatsAppService {
+  constructor() {
+    this.sock = null;
+    this.isConnected = false;
+    this.isProcessing = false;
+  }
+
+  async startBot() {
+    try {
+      const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+      const { version, isLatest } = await fetchLatestWaWebVersion();
+      console.log(`Using Baileys WA v${version.join('.')}, isLatest: ${isLatest}`);
+
+      this.sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: false,
+        markOnlineOnConnect: false,
+        syncFullHistory: false,
+        browser: ["TCR Dispatcher", "Chrome", "120.0.0"]
+      });
+
+      this.sock.ev.on('creds.update', saveCreds);
+
+      this.sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+          console.log('\nQR Code generated! Scan with WhatsApp:\n');
+          qrcode.generate(qr, { small: true });
+
+          await telegramService.sendAlert(
+            `📱 *WhatsApp Scan Required*\n\nPlease scan the QR code in terminal or use code below:\n\`\`\`\n${qr}\n\`\`\``
+          );
+        }
+
+        if (connection === 'close') {
+          this.isConnected = false;
+          const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+          console.log('WhatsApp Connection closed. Reconnecting:', shouldReconnect);
+
+          if (shouldReconnect) {
+            setTimeout(() => this.startBot(), 3000);
+          } else {
+            await telegramService.sendAlert('⚠️ *WhatsApp Disconnected*\nSession logged out. QR scan required.');
+          }
+        } else if (connection === 'open') {
+          this.isConnected = true;
+          console.log('✅ Connected to WhatsApp Web Daemon!');
+        }
+      });
+    } catch (err) {
+      console.error('Error starting WhatsApp socket:', err);
+      await telegramService.sendAlert(`🚨 *WhatsApp Initialization Error*\n${err.message}`);
+    }
+  }
+
+  formatZoomStartTime(dateVal, timeStr) {
+    try {
+      const rawDate = new Date(dateVal);
+      if (isNaN(rawDate.getTime())) return null;
+
+      const parts = timeStr.toUpperCase().split('-');
+      let startStr = parts[0].trim();
+      let match = startStr.match(/(\d+)(?::(\d+))?/);
+      if (!match) return null;
+
+      let hours = parseInt(match[1], 10);
+      let mins = match[2] ? parseInt(match[2], 10) : 0;
+
+      let ampm = startStr.includes('PM') ? 'PM' : (startStr.includes('AM') ? 'AM' : null);
+      if (!ampm) {
+        ampm = (hours >= 7 && hours <= 11) ? 'AM' : 'PM';
+      }
+
+      if (ampm === 'PM' && hours !== 12) hours += 12;
+      if (ampm === 'AM' && hours === 12) hours = 0;
+
+      const year = rawDate.getFullYear();
+      const month = String(rawDate.getMonth() + 1).padStart(2, '0');
+      const day = String(rawDate.getDate()).padStart(2, '0');
+      const formattedHours = String(hours).padStart(2, '0');
+      const formattedMins = String(mins).padStart(2, '0');
+
+      return `${year}-${month}-${day}T${formattedHours}:${formattedMins}:00Z`;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  getOrdinalSuffix(d) {
+    if (d > 3 && d < 21) return 'th';
+    switch (d % 10) {
+      case 1: return "st";
+      case 2: return "nd";
+      case 3: return "rd";
+      default: return "th";
+    }
+  }
+
+  async processDailySchedules() {
+    if (!this.sock || !this.isConnected) {
+      throw new Error('WhatsApp socket is not connected.');
+    }
+
+    const { classes: allClasses, settings: groupDirectory } = await googleSheetsService.getClassesAndSettings();
+
+    if (!allClasses || allClasses.length === 0) {
+      console.log('No pending classes found in Google Sheet.');
+      return { count: 0, message: 'No pending classes found.' };
+    }
+
+    const istFormatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric'
+    });
+
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const tomorrowISTStr = istFormatter.format(tomorrow);
+
+    const tomorrowsClasses = allClasses.filter(item => {
+      const rowDate = new Date(item.date);
+      if (isNaN(rowDate)) return false;
+      return istFormatter.format(rowDate) === tomorrowISTStr;
+    });
+
+    if (tomorrowsClasses.length === 0) {
+      console.log('No classes scheduled for tomorrow.');
+      return { count: 0, message: 'No classes scheduled for tomorrow.' };
+    }
+
+    const normalizedDirectory = {};
+    if (groupDirectory) {
+      for (const rawKey in groupDirectory) {
+        normalizedDirectory[rawKey.trim().toLowerCase()] = groupDirectory[rawKey];
+      }
+    }
+
+    const groupedClasses = {};
+    for (const item of tomorrowsClasses) {
+      const centerClean = String(item.center || '').trim().toLowerCase();
+      const courseClean = String(item.course || '').trim().toLowerCase();
+      const key = `${centerClean}_${courseClean}`;
+
+      if (!groupedClasses[key]) {
+        groupedClasses[key] = { date: item.date, course: item.course, center: item.center, sessions: [] };
+      }
+      groupedClasses[key].sessions.push(item);
+    }
+
+    let dispatchedCount = 0;
+    let zoomCollisionOffset = 1;
+
+    for (const key in groupedClasses) {
+      const group = groupedClasses[key];
+      const rawGroupIds = normalizedDirectory[key] || groupDirectory[key];
+
+      if (!rawGroupIds) {
+        const warnMsg = `⚠️ *Routing Warning*\nNo group ID found in Settings tab for key: \`${key}\``;
+        console.warn(warnMsg);
+        await telegramService.sendAlert(warnMsg);
+        continue;
+      }
+
+      const targetGroups = rawGroupIds.split(',').map(id => id.trim()).filter(Boolean);
+
+      const rawDate = new Date(group.date);
+      const istDate = new Date(rawDate.getTime() + (5.5 * 60 * 60 * 1000));
+      const day = istDate.getDate();
+      const month = istDate.toLocaleString('en-US', { month: 'long' });
+      const formattedDate = `${day}${this.getOrdinalSuffix(day)} ${month}`;
+
+      let message = `*TCR – ${group.course.toUpperCase()} CLASS FLOW*\n\n` +
+                    `*Class Schedule*\n` +
+                    `📌 ${formattedDate}\n\n`;
+
+      const centerNormalized = String(group.center || '').toLowerCase().trim();
+      const centerRequiresZoom = config.zoom.centersRequiringZoom.includes(centerNormalized);
+
+      for (const session of group.sessions) {
+        message += `*${session.time}*\n` +
+                   `Subject: *${session.subject}*\n` +
+                   `Faculty: *${session.faculty.toUpperCase()}*\n`;
+
+        const subjectLower = String(session.subject || '').toLowerCase();
+        const isOfflineEvent = subjectLower.includes('mock') || subjectLower.includes('test');
+
+        if (centerRequiresZoom && !isOfflineEvent) {
+          let exactZoomStartTime = this.formatZoomStartTime(group.date, session.time);
+          if (exactZoomStartTime) {
+            const meetingTitle = `TCR ${group.center} ${session.course} - ${session.subject} (${session.faculty})`;
+            const secondOffset = String(zoomCollisionOffset % 60).padStart(2, '0');
+            exactZoomStartTime = exactZoomStartTime.substring(0, 17) + secondOffset;
+            zoomCollisionOffset++;
+
+            await new Promise(res => setTimeout(res, config.timings.apiBreatherMs));
+            let joinUrl = await zoomService.createMeeting(meetingTitle, exactZoomStartTime);
+
+            if (!joinUrl) {
+              await new Promise(res => setTimeout(res, config.timings.zoomRetryMs));
+              joinUrl = await zoomService.createMeeting(meetingTitle, exactZoomStartTime);
+            }
+
+            if (joinUrl) {
+              message += `🔗 *Zoom:* ${joinUrl}\n`;
+            } else {
+              message += `🔗 *Zoom:* Link pending (Will be shared shortly)\n`;
+              await telegramService.sendAlert(`⚠️ *Zoom Meeting Failed*\nCould not create link for: ${meetingTitle}`);
+            }
+          }
+        }
+        message += `\n`;
+      }
+
+      message += `Regards,\n*TEAM TCR*`;
+
+      let atLeastOneSuccess = false;
+      for (const jid of targetGroups) {
+        try {
+          await this.sock.sendMessage(jid, { text: message.trim() });
+          console.log(`Sent schedule for ${key} to ${jid}`);
+          atLeastOneSuccess = true;
+          await new Promise(res => setTimeout(res, config.timings.messageDelayMs));
+        } catch (sendErr) {
+          const sendErrMsg = `❌ *WhatsApp Dispatch Error*\nFailed to send to group \`${jid}\`: ${sendErr.message}`;
+          console.error(sendErrMsg);
+          await telegramService.sendAlert(sendErrMsg);
+        }
+      }
+
+      if (atLeastOneSuccess) {
+        for (const session of group.sessions) {
+          await googleSheetsService.markRowAsSent(session.rowIndex);
+          dispatchedCount++;
+        }
+      }
+    }
+
+    return { count: dispatchedCount, message: `Successfully dispatched ${dispatchedCount} classes.` };
+  }
+}
+
+module.exports = new WhatsAppService();
