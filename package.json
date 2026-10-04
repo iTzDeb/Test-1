@@ -1,0 +1,19 @@
+{
+  "name": "tcr-automation-suite",
+  "version": "1.0.0",
+  "description": "Unified TCR Coaching Institute Automation Suite",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.12",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "googleapis": "^144.0.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
